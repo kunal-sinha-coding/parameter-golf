@@ -613,8 +613,9 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        # x = torch.relu(self.fc(x))
+	x = F.leaky_relu(self.fc(x), negative_slope=0.5).square() # Edit - LeakyReLU
+	return self.proj(x.square())
 
 
 class Block(nn.Module):

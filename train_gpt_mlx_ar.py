@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """
-The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
+- Switches the MLX baseline to the AR-calibrated record-style stack: 11 layers, LeakyReLU(0.5)^2 MLP, partial RoPE, BigramHash, and XSA on all layers by default.
+- Adds autoregressive self-generated calibration data collection so post-training quantization does not read train or validation tokens.
+- Replaces the int8+zlib export path with an int6 + LZMA export path using Hessian-aware GPTQ-style row quantization when calibration Hessians are available.
+- Adds size-targeted selective pruning of low-impact +/-1 quantized values so the compressed artifact can be pushed toward a requested byte budget.
+- Marks all substantive changes with inline `EDIT:` comments so the diff is easy to audit.
 
-Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
+Repo: https://github.com/kunal-sinha-coding/parameter-golf/blob/main/records/track_10min_16mb/2026-03-25_ValCalib_GPTQ_XSA_BigramHash3072/README.md
+
+Command:
+BIGRAM_VOCAB_SIZE=3072 BIGRAM_DIM=112 WARMDOWN_ITERS=4000 TARGET_MB=15.9 SEED=314 python3 train_gpt_mlx_ar.py
 """
 from __future__ import annotations
 
 import glob
 import json
+import lzma
 import math
 import os
 import pickle
 import sys
 import time
 import uuid
-import zlib
 from collections.abc import Callable
 from pathlib import Path
 
@@ -49,16 +56,16 @@ class Hyperparameters:
 
     # Training loop. These defaults now mirror train_gpt.py on a single process.
     iterations: int = int(os.environ.get("ITERATIONS", 20_000))
-    val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
+    val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 4000))
     # Validation always uses the full fineweb_val split.
     val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     # Optional local-debug cap for validation tokens. Keeps short runs short, but
     # makes val_loss / val_bpb only approximately comparable to full-val runs.
     val_max_tokens: int = int(os.environ.get("VAL_MAX_TOKENS", 0))
-    train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
-    train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
+    train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 500))
+    train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
-    train_seq_len: int = int(os.environ.get("TRAIN_SEQ_LEN", os.environ.get("TRAIN_MAX_SEQ_LEN", 1024)))
+    train_seq_len: int = int(os.environ.get("TRAIN_SEQ_LEN", os.environ.get("TRAIN_MAX_SEQ_LEN", 2048)))
     # Chunk each logical MLX microbatch into smaller sub-batches to reduce peak
     # memory pressure without changing the effective optimizer batch.
     mlx_max_microbatch_tokens: int = int(os.environ.get("MLX_MAX_MICROBATCH_TOKENS", 8_192))
@@ -67,35 +74,53 @@ class Hyperparameters:
     # Disable on 32GB+ unified memory for better throughput (MLX_EAGER_EVAL=0).
     mlx_eager_eval: bool = bool(int(os.environ.get("MLX_EAGER_EVAL", "1")))
     warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 20))
-    warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 4000))
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     # Model (defaults match the current baseline setup).
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers: int = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers: int = int(os.environ.get("NUM_LAYERS", 11))
     model_dim: int = int(os.environ.get("MODEL_DIM", 512))
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
-    mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult: int = int(float(os.environ.get("MLP_MULT", 3.0)))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    bigram_vocab_size: int = int(os.environ.get("BIGRAM_VOCAB_SIZE", 3072))
+    bigram_dim: int = int(os.environ.get("BIGRAM_DIM", 112))
+    xsa_last_n: int = int(os.environ.get("XSA_LAST_N", 11))
+    rope_dims: int = int(os.environ.get("ROPE_DIMS", 16))
+    bigram_scale_init: float = float(os.environ.get("BIGRAM_SCALE_INIT", 0.05))
+    smear_enabled: bool = bool(int(os.environ.get("SMEAR_ENABLED", "1")))
+    ve_enabled: bool = bool(int(os.environ.get("VE_ENABLED", "1")))
+    ve_dim: int = int(os.environ.get("VE_DIM", 128))
+    ve_layers: str = os.environ.get("VE_LAYERS", "9,10")
+    calib_num_seqs: int = int(os.environ.get("CALIB_NUM_SEQS", 64))
+    calib_batch_size: int = int(os.environ.get("CALIB_BATCH_SIZE", 8))
+    calib_temperature: float = float(os.environ.get("CALIB_TEMPERATURE", 0.8))
+    gptq_block_size: int = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
+    target_mb: float = float(os.environ.get("TARGET_MB", 15.9))
+    ema_decay: float = float(os.environ.get("EMA_DECAY", 0.997))
+    swa_enabled: bool = bool(int(os.environ.get("SWA_ENABLED", "1")))
+    swa_every: int = int(os.environ.get("SWA_EVERY", 50))
+    swa_start_lr_frac: float = float(os.environ.get("SWA_START_LR_FRAC", 0.2))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
     beta2: float = float(os.environ.get("BETA2", 0.95))
     adam_eps: float = float(os.environ.get("ADAM_EPS", 1e-8))
-    tied_embed_lr: float = float(os.environ.get("TIED_EMBED_LR", 0.05))
-    matrix_lr: float = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr: float = float(os.environ.get("SCALAR_LR", 0.04))
-    muon_momentum: float = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    tied_embed_lr: float = float(os.environ.get("TIED_EMBED_LR", 0.035))
+    matrix_lr: float = float(os.environ.get("MATRIX_LR", 0.025))
+    scalar_lr: float = float(os.environ.get("SCALAR_LR", 0.025))
+    muon_momentum: float = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps: int = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_momentum_warmup_start: float = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
-    muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
-    grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    muon_momentum_warmup_start: float = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
+    muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
+    grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
 
     out_dir: str = os.environ.get("OUT_DIR", "logs")
 
@@ -127,7 +152,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,bigram.scale,smear.gate,ve_layer_scales,ve_shared.scale",
     ).split(",")
     if pattern
 )
@@ -295,6 +320,61 @@ class RMSNormNoWeight(nn.Module):
         return rms_norm(x)
 
 
+class BigramHashEmbedding(nn.Module):
+    # EDIT: Hash previous/current token pairs into a compact learned table and project it into model space.
+    def __init__(self, vocab_size: int, bigram_vocab_size: int, bigram_dim: int, dim: int, scale_init: float):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.bigram_vocab_size = bigram_vocab_size
+        self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
+        self.embed.weight = mx.zeros_like(self.embed.weight)
+        self.proj = CastedLinear(bigram_dim, dim) if bigram_dim != dim else None
+        if self.proj is not None:
+            self.proj.weight = mx.zeros_like(self.proj.weight)
+        self.scale = mx.array(scale_init, dtype=mx.float32)
+
+    def __call__(self, input_ids: mx.array) -> mx.array:
+        t = input_ids.astype(mx.int32)
+        mod = int(self.bigram_vocab_size) - 1
+        first = mx.full((input_ids.shape[0], 1), mod, dtype=mx.int32)
+        rest = ((36313 * t[:, 1:]) ^ (27191 * t[:, :-1])) % mod
+        bigram_ids = mx.concatenate([first, rest.astype(mx.int32)], axis=1)
+        x = self.embed(bigram_ids.astype(mx.int32)).astype(COMPUTE_DTYPE)
+        if self.proj is not None:
+            x = self.proj(x)
+        return self.scale.astype(x.dtype) * x
+
+
+class SmearGate(nn.Module):
+    # EDIT: Blend each token with its previous token using a learned per-channel gate.
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate = mx.zeros((dim,), dtype=mx.float32)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        g = nn.sigmoid(self.gate.astype(x.dtype))[None, None, :]
+        x_prev = mx.concatenate([mx.zeros_like(x[:, :1]), x[:, :-1]], axis=1)
+        return (1.0 - g) * x + g * x_prev
+
+
+class ValueEmbedding(nn.Module):
+    # EDIT: Reinject token identity into attention values on a chosen subset of layers.
+    def __init__(self, vocab_size: int, ve_dim: int, kv_dim: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, ve_dim)
+        self.embed.weight = (mx.random.normal(self.embed.weight.shape, dtype=mx.float32) * 0.01).astype(COMPUTE_DTYPE)
+        self.proj = CastedLinear(ve_dim, kv_dim) if ve_dim != kv_dim else None
+        if self.proj is not None:
+            self.proj.weight = mx.zeros_like(self.proj.weight)
+        self.scale = mx.array(0.1, dtype=mx.float32)
+
+    def __call__(self, input_ids: mx.array) -> mx.array:
+        x = self.embed(input_ids).astype(COMPUTE_DTYPE)
+        if self.proj is not None:
+            x = self.proj(x)
+        return self.scale.astype(x.dtype) * x
+
+
 class CausalSelfAttention(nn.Module):
     # - separate q/k/v projections
     # - RMSNorm on q and k before attention
@@ -307,6 +387,8 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        rope_dims: int,
+        use_xsa: bool,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -318,25 +400,68 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
+        if rope_dims < 0 or rope_dims > self.head_dim or rope_dims % 2 != 0:
+            raise ValueError(f"rope_dims must be an even value in [0, head_dim], got {rope_dims}")
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim)
         self.c_k = CastedLinear(dim, kv_dim)
         self.c_v = CastedLinear(dim, kv_dim)
         self.proj = CastedLinear(dim, dim)
         self.q_gain = mx.ones((num_heads,), dtype=mx.float32) * qk_gain_init
-        self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
+        self.rope_dims = rope_dims
+        self.use_xsa = use_xsa
+        self.rope = nn.RoPE(self.rope_dims, traditional=False, base=rope_base) if self.rope_dims > 0 else None
         self.scale = self.head_dim ** -0.5
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def apply_partial_rope(self, x: mx.array) -> mx.array:
+        # EDIT: Only the leading rope_dims channels get rotated; the rest pass through untouched.
+        if self.rope is None or self.rope_dims == 0:
+            return x
+        if self.rope_dims == self.head_dim:
+            return self.rope(x)
+        x_rope = self.rope(x[..., : self.rope_dims])
+        return mx.concatenate([x_rope, x[..., self.rope_dims :]], axis=-1)
+
+    def apply_xsa(self, y: mx.array, v: mx.array) -> mx.array:
+        # EDIT: GQA-aware XSA removes the output component aligned with each token's own value vector.
+        if not self.use_xsa:
+            return y
+        group = self.num_heads // self.num_kv_heads
+        y_grouped = y.reshape(y.shape[0], self.num_kv_heads, group, y.shape[2], y.shape[3])
+        v_grouped = v[:, :, None, :, :]
+        numer = mx.sum(y_grouped * v_grouped, axis=-1, keepdims=True)
+        denom = mx.sum(v_grouped * v_grouped, axis=-1, keepdims=True) + 1e-6
+        y_grouped = y_grouped - (numer / denom) * v_grouped
+        return y_grouped.reshape(y.shape)
+
+    def __call__(
+        self,
+        x: mx.array,
+        v_embed: mx.array | None = None,
+        collector: dict[str, list[np.ndarray]] | None = None,
+        prefix: str = "",
+    ) -> mx.array:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = self.c_v(x)
+        if v_embed is not None:
+            v = v + v_embed.astype(v.dtype)
+        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        if collector is not None:
+            x_np = np.ascontiguousarray(np.array(x.astype(mx.float32)))
+            collector.setdefault(f"{prefix}.c_q.weight", []).append(x_np.reshape(-1, x_np.shape[-1]))
+            collector.setdefault(f"{prefix}.c_k.weight", []).append(x_np.reshape(-1, x_np.shape[-1]))
+            collector.setdefault(f"{prefix}.c_v.weight", []).append(x_np.reshape(-1, x_np.shape[-1]))
 
-        q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
-        k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
+        q = self.apply_partial_rope(rms_norm(q).astype(COMPUTE_DTYPE))
+        k = self.apply_partial_rope(rms_norm(k).astype(COMPUTE_DTYPE))
         q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
+        y = self.apply_xsa(y, v)
+        if collector is not None:
+            y_np = np.ascontiguousarray(np.array(y.transpose(0, 2, 1, 3).reshape(-1, dim).astype(mx.float32)))
+            collector.setdefault(f"{prefix}.proj.weight", []).append(y_np)
         y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -349,9 +474,17 @@ class MLP(nn.Module):
         self.fc = CastedLinear(dim, hidden)
         self.proj = CastedLinear(hidden, dim)
 
-    def __call__(self, x: mx.array) -> mx.array:
-        x = nn.relu(self.fc(x))
-        return self.proj(x * x)
+    def __call__(self, x: mx.array, collector: dict[str, list[np.ndarray]] | None = None, prefix: str = "") -> mx.array:
+        # EDIT: The record stack uses LeakyReLU(0.5)^2 instead of ReLU^2.
+        if collector is not None:
+            x_np = np.ascontiguousarray(np.array(x.astype(mx.float32)))
+            collector.setdefault(f"{prefix}.fc.weight", []).append(x_np.reshape(-1, x_np.shape[-1]))
+        h = nn.leaky_relu(self.fc(x), negative_slope=0.5)
+        h = h * h
+        if collector is not None:
+            h_np = np.ascontiguousarray(np.array(h.astype(mx.float32)))
+            collector.setdefault(f"{prefix}.proj.weight", []).append(h_np.reshape(-1, h_np.shape[-1]))
+        return self.proj(h)
 
 
 class Block(nn.Module):
@@ -363,22 +496,37 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        rope_dims: int,
+        use_xsa: bool,
+        layer_index: int,
+        smear_enabled: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dims, use_xsa)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = mx.ones((dim,), dtype=mx.float32)
-        self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
+        self.smear = SmearGate(dim) if smear_enabled else None
+        ln_scale = 1.0 / math.sqrt(layer_index + 1.0)
+        self.attn_scale = mx.ones((dim,), dtype=mx.float32) * ln_scale
+        self.mlp_scale = mx.ones((dim,), dtype=mx.float32) * ln_scale
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
 
-    def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
+    def __call__(
+        self,
+        x: mx.array,
+        x0: mx.array,
+        v_embed: mx.array | None = None,
+        collector: dict[str, list[np.ndarray]] | None = None,
+        prefix: str = "",
+    ) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        if self.smear is not None:
+            x = self.smear(x)
+        attn_out = self.attn(self.attn_norm(x), v_embed=v_embed, collector=collector, prefix=f"{prefix}.attn")
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x), collector=collector, prefix=f"{prefix}.mlp")
         return x
 
 
@@ -389,7 +537,8 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, bigram_vocab_size: int, bigram_dim: int, xsa_last_n: int, rope_dims: int,
+                 bigram_scale_init: float, smear_enabled: bool, ve_enabled: bool, ve_dim: int, ve_layers: str):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -397,12 +546,38 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
+        # EDIT: Add a hashed bigram side-channel to the tied embedding pathway.
+        self.bigram = BigramHashEmbedding(vocab_size, bigram_vocab_size, bigram_dim, dim, bigram_scale_init)
+        self.kv_dim = self.num_kv_heads = num_kv_heads
+        self._ve_target_dim = num_kv_heads * (dim // num_heads)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
+        self.ve_layer_indices = [int(x) for x in ve_layers.split(",") if x.strip()] if ve_enabled else []
+        self.ve_layer_to_scale_idx = {layer_idx: i for i, layer_idx in enumerate(self.ve_layer_indices)}
+        if self.ve_layer_indices:
+            self.ve_shared = ValueEmbedding(vocab_size, ve_dim, self._ve_target_dim)
+            self.ve_layer_scales = [
+                mx.ones((1,), dtype=mx.float32)
+                for _ in self.ve_layer_indices
+            ]
+        else:
+            self.ve_shared = None
+            self.ve_layer_scales = []
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            Block(
+                dim,
+                num_heads,
+                num_kv_heads,
+                mlp_mult,
+                rope_base,
+                qk_gain_init,
+                rope_dims,
+                i >= max(num_layers - xsa_last_n, 0),
+                i,
+                smear_enabled,
+            )
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
@@ -419,12 +594,16 @@ class GPT(nn.Module):
         return c * mx.tanh(logits / c)
 
     def __call__(self, input_ids: mx.array) -> mx.array:
-        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        x = rms_norm((self.tok_emb(input_ids) + self.bigram(input_ids)).astype(COMPUTE_DTYPE))
         x0 = x
         skips: list[mx.array] = []
+        ve_base = self.ve_shared(input_ids) if self.ve_shared is not None else None
 
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            ve = None
+            if ve_base is not None and i in self.ve_layer_to_scale_idx:
+                ve = ve_base * self.ve_layer_scales[self.ve_layer_to_scale_idx[i]].astype(ve_base.dtype)
+            x = self.blocks[i](x, x0, v_embed=ve)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             # Odd layer counts have one more decoder block than encoder block. The baseline only
@@ -432,7 +611,33 @@ class GPT(nn.Module):
             # without an added skip.
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            block_idx = self.num_encoder_layers + i
+            ve = None
+            if ve_base is not None and block_idx in self.ve_layer_to_scale_idx:
+                ve = ve_base * self.ve_layer_scales[self.ve_layer_to_scale_idx[block_idx]].astype(ve_base.dtype)
+            x = self.blocks[block_idx](x, x0, v_embed=ve)
+        return self.final_norm(x)
+
+    def forward_with_collector(self, input_ids: mx.array, collector: dict[str, list[np.ndarray]] | None = None) -> mx.array:
+        # EDIT: This uncompiled path mirrors the forward pass but records linear-layer inputs for AR GPTQ calibration.
+        x = rms_norm((self.tok_emb(input_ids) + self.bigram(input_ids)).astype(COMPUTE_DTYPE))
+        x0 = x
+        skips: list[mx.array] = []
+        ve_base = self.ve_shared(input_ids) if self.ve_shared is not None else None
+        for i in range(self.num_encoder_layers):
+            ve = None
+            if ve_base is not None and i in self.ve_layer_to_scale_idx:
+                ve = ve_base * self.ve_layer_scales[self.ve_layer_to_scale_idx[i]].astype(ve_base.dtype)
+            x = self.blocks[i](x, x0, v_embed=ve, collector=collector, prefix=f"blocks.{i}")
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
+            block_idx = self.num_encoder_layers + i
+            ve = None
+            if ve_base is not None and block_idx in self.ve_layer_to_scale_idx:
+                ve = ve_base * self.ve_layer_scales[self.ve_layer_to_scale_idx[block_idx]].astype(ve_base.dtype)
+            x = self.blocks[block_idx](x, x0, v_embed=ve, collector=collector, prefix=f"blocks.{block_idx}")
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
@@ -493,16 +698,33 @@ class SplitOptimizers:
     def __init__(self, model: GPT, args: Hyperparameters):
         self.args = args
         params = dict(tree_flatten(model.parameters()))
-        self.embed_key = "tok_emb.weight"
+        self.embed_keys = ["tok_emb.weight", "bigram.embed.weight"]
+        if model.bigram.proj is not None:
+            self.embed_keys.append("bigram.proj.weight")
+        if model.ve_shared is not None:
+            self.embed_keys.append("ve_shared.embed.weight")
+            if model.ve_shared.proj is not None:
+                self.embed_keys.append("ve_shared.proj.weight")
         self.matrix_keys = [
             k
             for k, p in params.items()
-            if k.startswith("blocks.") and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            if (
+                (k.startswith("blocks.") or k == "bigram.proj.weight" or k == "ve_shared.proj.weight")
+                and p.ndim == 2
+                and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            )
         ]
         self.scalar_keys = [
             k
             for k, p in params.items()
-            if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            if (
+                k == "skip_weights"
+                or k == "bigram.scale"
+                or k == "smear.gate"
+                or k == "ve_shared.scale"
+                or k.startswith("ve_layer_scales.")
+                or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            )
         ]
 
         self.muon = Muon(self.matrix_keys, params, args)
@@ -529,8 +751,8 @@ class SplitOptimizers:
         self.adam_embed.learning_rate = self.args.tied_embed_lr * lr_mul
         updated.update(
             self.adam_embed.apply_gradients(
-                {self.embed_key: grads[self.embed_key]},
-                {self.embed_key: params[self.embed_key]},
+                {k: grads[k] for k in self.embed_keys},
+                {k: params[k] for k in self.embed_keys},
             )
         )
 
@@ -542,11 +764,11 @@ class SplitOptimizers:
         model.update(tree_unflatten(list(updated.items())))
 
 # ==============================================================================
-# QUANTIZATION (INT8 + ZLIB)
+# QUANTIZATION (AR GPTQ INT6 + LZMA)
 # ==============================================================================
-# - per-row int8 for 2D float tensors
-# - per-tensor int8 for other float tensors
-# - fp16 passthrough for small float tensors
+# - 2D tensors use int6 row-wise quantization
+# - when AR calibration Hessians are available, use a GPTQ-style preconditioned solve
+# - small/control tensors stay in float form
 # - exact passthrough for non-floats
 
 MX_DTYPE_FROM_NAME = {
@@ -555,11 +777,12 @@ MX_DTYPE_FROM_NAME = {
     "bfloat16": mx.bfloat16,
 }
 
-INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
-INT8_KEEP_FLOAT_STORE_DTYPE = np.float16
-INT8_PER_ROW_SCALE_DTYPE = np.float16
-INT8_CLIP_PERCENTILE = 99.99984
-INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+INT6_MAX = 31
+INT6_KEEP_FLOAT_MAX_NUMEL = 65_536
+INT6_KEEP_FLOAT_STORE_DTYPE = np.float16
+INT6_PER_ROW_SCALE_DTYPE = np.float16
+INT6_CLIP_PERCENTILE = 99.99984
+INT6_CLIP_Q = INT6_CLIP_PERCENTILE / 100.0
 
 
 def _np_float32(arr: mx.array) -> np.ndarray:
@@ -571,29 +794,58 @@ def keep_float_array(name: str, arr: mx.array, passthrough_orig_dtypes: dict[str
         return np.ascontiguousarray(_np_float32(arr))
     if arr.dtype in {mx.float32, mx.bfloat16}:
         passthrough_orig_dtypes[name] = str(arr.dtype).split(".")[-1]
-        return np.ascontiguousarray(np.array(arr.astype(mx.float16), dtype=INT8_KEEP_FLOAT_STORE_DTYPE, copy=False))
+        return np.ascontiguousarray(np.array(arr.astype(mx.float16), dtype=INT6_KEEP_FLOAT_STORE_DTYPE, copy=False))
     return np.ascontiguousarray(np.array(arr, copy=True))
 
 
-def quantize_float_array(arr: mx.array) -> tuple[np.ndarray, np.ndarray]:
-    f32 = _np_float32(arr)
-    if f32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
-        clip_abs = np.quantile(np.abs(f32), INT8_CLIP_Q, axis=1) if f32.size else np.empty((f32.shape[0],), dtype=np.float32)
-        clipped = np.clip(f32, -clip_abs[:, None], clip_abs[:, None])
-        scale = np.maximum(clip_abs / 127.0, 1.0 / 127.0).astype(np.float32, copy=False)
-        q = np.clip(np.round(clipped / scale[:, None]), -127, 127).astype(np.int8, copy=False)
-        return np.ascontiguousarray(q), np.ascontiguousarray(scale.astype(INT8_PER_ROW_SCALE_DTYPE, copy=False))
-
-    # Vectors / scalars use a simpler per-tensor scale.
-    clip_abs = float(np.quantile(np.abs(f32).reshape(-1), INT8_CLIP_Q)) if f32.size else 0.0
-    scale = np.array(clip_abs / 127.0 if clip_abs > 0.0 else 1.0, dtype=np.float32)
-    q = np.clip(np.round(np.clip(f32, -clip_abs, clip_abs) / scale), -127, 127).astype(np.int8, copy=False)
+def quantize_row_int6(row: np.ndarray) -> tuple[np.ndarray, np.float32]:
+    clip_abs = float(np.quantile(np.abs(row), INT6_CLIP_Q)) if row.size else 0.0
+    scale = np.float32(max(clip_abs / INT6_MAX, 1.0 / INT6_MAX))
+    q = np.clip(np.round(np.clip(row, -clip_abs, clip_abs) / scale), -INT6_MAX, INT6_MAX).astype(np.int8, copy=False)
     return np.ascontiguousarray(q), scale
 
 
-def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str, object], dict[str, int]]:
+def gptq_quantize_matrix(weight: np.ndarray, hessian: np.ndarray | None, block_size: int) -> tuple[np.ndarray, np.ndarray]:
+    # EDIT: Apply a compact Full-Hessian GPTQ-style solve row-by-row when calibration Hessians exist.
+    w = np.ascontiguousarray(weight.astype(np.float32, copy=False))
+    q = np.empty_like(w, dtype=np.int8)
+    scales = np.empty((w.shape[0],), dtype=np.float32)
+    if hessian is None or hessian.shape[0] != w.shape[1]:
+        for row_idx in range(w.shape[0]):
+            q[row_idx], scales[row_idx] = quantize_row_int6(w[row_idx])
+        return q, scales
+
+    h = np.array(hessian, dtype=np.float64, copy=True)
+    h.flat[:: h.shape[0] + 1] += 1e-4
+    inv = np.linalg.inv(h)
+    for row_idx in range(w.shape[0]):
+        row = w[row_idx].astype(np.float64, copy=True)
+        q_row = np.empty((w.shape[1],), dtype=np.int8)
+        _, scale = quantize_row_int6(row.astype(np.float32, copy=False))
+        scales[row_idx] = scale
+        for block_start in range(0, w.shape[1], block_size):
+            block_end = min(block_start + block_size, w.shape[1])
+            for col in range(block_start, block_end):
+                q_val = np.clip(np.round(row[col] / scale), -INT6_MAX, INT6_MAX)
+                q_row[col] = np.int8(q_val)
+                err = row[col] - float(q_val) * float(scale)
+                row -= err * inv[:, col] / max(inv[col, col], 1e-8)
+        q[row_idx] = q_row
+    return np.ascontiguousarray(q), np.ascontiguousarray(scales.astype(INT6_PER_ROW_SCALE_DTYPE, copy=False))
+
+
+def quantize_vector_int6(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    clip_abs = float(np.quantile(np.abs(arr).reshape(-1), INT6_CLIP_Q)) if arr.size else 0.0
+    scale = np.array(clip_abs / INT6_MAX if clip_abs > 0.0 else 1.0, dtype=np.float32)
+    q = np.clip(np.round(np.clip(arr, -clip_abs, clip_abs) / scale), -INT6_MAX, INT6_MAX).astype(np.int8, copy=False)
+    return np.ascontiguousarray(q), scale
+
+
+def quantize_state_dict_int6(
+    flat_state: dict[str, mx.array],
+    hessians: dict[str, np.ndarray] | None,
+    block_size: int,
+) -> tuple[dict[str, object], dict[str, int]]:
     quantized: dict[str, np.ndarray] = {}
     scales: dict[str, np.ndarray] = {}
     dtypes: dict[str, str] = {}
@@ -601,7 +853,7 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
     passthrough_orig_dtypes: dict[str, str] = {}
     qmeta: dict[str, dict[str, object]] = {}
     stats = dict.fromkeys(
-        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
+        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int6_payload_bytes"),
         0,
     )
     for name, arr in flat_state.items():
@@ -611,27 +863,29 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
         if not mx.issubdtype(arr.dtype, mx.floating):
             stats["num_nonfloat_tensors"] += 1
             passthrough[name] = np.ascontiguousarray(np.array(arr))
-            stats["int8_payload_bytes"] += int(passthrough[name].nbytes)
+            stats["int6_payload_bytes"] += int(passthrough[name].nbytes)
             continue
 
-        # Small float tensors are cheap enough to keep directly. We still downcast
-        # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
-        if int(arr.size) <= INT8_KEEP_FLOAT_MAX_NUMEL:
+        if int(arr.size) <= INT6_KEEP_FLOAT_MAX_NUMEL:
             kept = keep_float_array(name, arr, passthrough_orig_dtypes)
             passthrough[name] = kept
-            stats["int8_payload_bytes"] += int(kept.nbytes)
+            stats["int6_payload_bytes"] += int(kept.nbytes)
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_array(arr)
+        f32 = _np_float32(arr)
+        if f32.ndim == 2:
+            q, s = gptq_quantize_matrix(f32, None if hessians is None else hessians.get(name), block_size)
+        else:
+            q, s = quantize_vector_int6(f32)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
         scales[name] = s
         dtypes[name] = str(arr.dtype).split(".")[-1]
-        stats["int8_payload_bytes"] += int(q.nbytes + s.nbytes)
+        stats["int6_payload_bytes"] += int(q.nbytes + s.nbytes)
     obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
+        "__quant_format__": "int6_gptq_ar_v1",
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
@@ -644,22 +898,54 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
     return obj, stats
 
 
-def dequantize_state_dict_int8(quant_obj: dict[str, object]) -> dict[str, mx.array]:
+def selective_prune_quantized_int6(
+    quant_obj: dict[str, object],
+    target_total_bytes: int,
+    code_bytes: int,
+) -> dict[str, object]:
+    # EDIT: Drop the least expensive +/-1 entries first, mirroring the record's size-targeted pruning pass.
+    current_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
+    current_total = len(lzma.compress(current_raw, preset=9)) + code_bytes
+    if current_total <= target_total_bytes:
+        return quant_obj
+    work = pickle.loads(pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL))
+    candidates: list[tuple[float, str, int]] = []
+    for name, q in work["quantized"].items():
+        q_np = np.asarray(q, dtype=np.int8)
+        scale = np.asarray(work["scales"][name], dtype=np.float32)
+        if scale.ndim == 0:
+            errors = np.full(q_np.shape, float(scale * scale), dtype=np.float32)
+        else:
+            errors = np.broadcast_to(scale[:, None] * scale[:, None], q_np.shape)
+        mask = np.abs(q_np) == 1
+        if np.any(mask):
+            flat_idx = np.flatnonzero(mask.reshape(-1))
+            flat_err = errors.reshape(-1)[flat_idx]
+            candidates.extend((float(err), name, int(idx)) for err, idx in zip(flat_err.tolist(), flat_idx.tolist(), strict=True))
+    candidates.sort(key=lambda x: x[0])
+    for _, name, flat_idx in candidates:
+        np.asarray(work["quantized"][name]).reshape(-1)[flat_idx] = 0
+        trial_raw = pickle.dumps(work, protocol=pickle.HIGHEST_PROTOCOL)
+        trial_total = len(lzma.compress(trial_raw, preset=9)) + code_bytes
+        if trial_total <= target_total_bytes:
+            return work
+    return work
+
+
+def dequantize_state_dict_int6(quant_obj: dict[str, object]) -> dict[str, mx.array]:
     out: dict[str, mx.array] = {}
     qmeta = quant_obj.get("qmeta", {})
     passthrough_orig_dtypes = quant_obj.get("passthrough_orig_dtypes", {})
     for name, q in quant_obj["quantized"].items():
-        q_np = np.asarray(q, dtype=np.int8)
+        q_np = np.asarray(q, dtype=np.int8).astype(np.float32)
         dtype_name = quant_obj["dtypes"][name]
         scale = np.asarray(quant_obj["scales"][name], dtype=np.float32)
         if qmeta.get(name, {}).get("scheme") == "per_row" or scale.ndim > 0:
-            # Broadcast the saved row scale back across trailing dimensions.
-            out_arr = q_np.astype(np.float32) * scale.reshape((q_np.shape[0],) + (1,) * (q_np.ndim - 1))
+            out_arr = q_np * scale.reshape((q_np.shape[0],) + (1,) * (q_np.ndim - 1))
         else:
-            out_arr = q_np.astype(np.float32) * float(scale)
+            out_arr = q_np * float(scale)
         out[name] = mx.array(out_arr, dtype=MX_DTYPE_FROM_NAME[dtype_name])
     for name, arr in quant_obj["passthrough"].items():
-        # Restore small tensors, undoing the temporary fp16 storage cast if needed.
         out_arr = np.array(arr, copy=True)
         orig_dtype = passthrough_orig_dtypes.get(name)
         if isinstance(orig_dtype, str):
@@ -667,6 +953,45 @@ def dequantize_state_dict_int8(quant_obj: dict[str, object]) -> dict[str, mx.arr
         else:
             out[name] = mx.array(out_arr)
     return out
+
+
+def sample_next_token(logits: np.ndarray, temperature: float, rng: np.random.Generator) -> np.ndarray:
+    if temperature <= 0:
+        return np.argmax(logits, axis=-1).astype(np.int32, copy=False)
+    scaled = logits / temperature
+    scaled = scaled - scaled.max(axis=-1, keepdims=True)
+    probs = np.exp(scaled)
+    probs /= probs.sum(axis=-1, keepdims=True)
+    return np.array([rng.choice(probs.shape[1], p=probs[i]) for i in range(probs.shape[0])], dtype=np.int32)
+
+
+def generate_autoregressive_calib_tokens(model: GPT, args: Hyperparameters) -> np.ndarray:
+    # EDIT: Generate calibration sequences from the model itself so quantization remains self-contained.
+    rng = np.random.default_rng(args.seed)
+    tokens = np.zeros((args.calib_num_seqs, args.train_seq_len), dtype=np.int32)
+    tokens[:, 0] = rng.integers(0, args.vocab_size, size=(args.calib_num_seqs,), dtype=np.int32)
+    for start in range(0, args.calib_num_seqs, args.calib_batch_size):
+        end = min(start + args.calib_batch_size, args.calib_num_seqs)
+        batch = tokens[start:end]
+        for pos in range(1, args.train_seq_len):
+            hidden = model(mx.array(batch[:, :pos], dtype=mx.int32))
+            logits = np.array((hidden[:, -1, :] @ model.tok_emb.weight.astype(hidden.dtype).T).astype(mx.float32))
+            logits = args.logit_softcap * np.tanh(logits / args.logit_softcap)
+            batch[:, pos] = sample_next_token(logits, args.calib_temperature, rng)
+        tokens[start:end] = batch
+    return tokens
+
+
+def collect_hessians_from_tokens(model: GPT, token_batches: np.ndarray) -> dict[str, np.ndarray]:
+    # EDIT: Replay AR-generated sequences through an instrumented forward pass and accumulate X^T X per linear layer.
+    collector: dict[str, list[np.ndarray]] = {}
+    for batch in token_batches:
+        model.forward_with_collector(mx.array(batch[None, :], dtype=mx.int32), collector=collector)
+    hessians: dict[str, np.ndarray] = {}
+    for name, chunks in collector.items():
+        x = np.concatenate(chunks, axis=0).astype(np.float64, copy=False)
+        hessians[name] = np.ascontiguousarray((x.T @ x) / max(x.shape[0], 1))
+    return hessians
 
 
 def build_sentencepiece_luts(
@@ -842,6 +1167,25 @@ def clip_grad_tree(grads_tree: dict, max_norm: float) -> dict:
     return tree_unflatten([(k, g * scale) for k, g in flat.items()])
 
 
+def snapshot_flat_state_np(model: nn.Module) -> dict[str, np.ndarray]:
+    flat = dict(tree_flatten(model.state))
+    snap: dict[str, np.ndarray] = {}
+    for name, arr in flat.items():
+        if mx.issubdtype(arr.dtype, mx.floating):
+            snap[name] = np.array(arr.astype(mx.float32), copy=True)
+        else:
+            snap[name] = np.array(arr, copy=True)
+    return snap
+
+
+def load_flat_state_np(model: nn.Module, flat_np: dict[str, np.ndarray]) -> None:
+    current = dict(tree_flatten(model.state))
+    restored = []
+    for name, arr in current.items():
+        restored.append((name, mx.array(flat_np[name], dtype=arr.dtype)))
+    model.update(tree_unflatten(restored))
+
+
 def main() -> None:
     # ==============================================================================
     # TOKENIZER + VALIDATION METRIC SETUP
@@ -866,7 +1210,7 @@ def main() -> None:
     log("=" * 100, console=False)
 
     if not args.tie_embeddings:
-        raise NotImplementedError("train_gpt_mlx.py only supports tied embeddings")
+        raise NotImplementedError("train_gpt_mlx_ar.py only supports tied embeddings")
     if not args.tokenizer_path.endswith(".model"):
         raise ValueError(f"TOKENIZER_PATH must point to a SentencePiece .model file: {args.tokenizer_path}")
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
@@ -906,6 +1250,15 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        bigram_vocab_size=args.bigram_vocab_size,
+        bigram_dim=args.bigram_dim,
+        xsa_last_n=args.xsa_last_n,
+        rope_dims=args.rope_dims,
+        bigram_scale_init=args.bigram_scale_init,
+        smear_enabled=args.smear_enabled,
+        ve_enabled=args.ve_enabled,
+        ve_dim=args.ve_dim,
+        ve_layers=args.ve_layers,
     )
     opt = SplitOptimizers(model, args)
 
@@ -946,6 +1299,13 @@ def main() -> None:
         f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
+    )
+    # EDIT: Surface the record-style architecture knobs directly in the log header.
+    log(
+        f"bigram_vocab_size:{args.bigram_vocab_size} bigram_dim:{args.bigram_dim} "
+        f"xsa_last_n:{args.xsa_last_n} rope_dims:{args.rope_dims} "
+        f"smear_enabled:{args.smear_enabled} ve_enabled:{args.ve_enabled} ve_layers:{args.ve_layers} "
+        f"calib_num_seqs:{args.calib_num_seqs} calib_temperature:{args.calib_temperature}"
     )
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
@@ -1011,6 +1371,9 @@ def main() -> None:
     stop_after_step: int | None = None
     t0 = time.perf_counter()
     step = 0
+    ema_state = snapshot_flat_state_np(model)
+    swa_state: dict[str, np.ndarray] | None = None
+    swa_count = 0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
@@ -1054,6 +1417,25 @@ def main() -> None:
         train_loss_value = float(train_loss.item())
         opt.step(model, grads, step=step, lr_mul=lr_mul)
         mx.synchronize()
+        current_flat_np = snapshot_flat_state_np(model)
+        for name, arr in current_flat_np.items():
+            if np.issubdtype(arr.dtype, np.floating):
+                ema_state[name] *= args.ema_decay
+                ema_state[name] += arr * (1.0 - args.ema_decay)
+            else:
+                ema_state[name] = arr
+        if args.swa_enabled and lr_mul < args.swa_start_lr_frac and (step + 1) % args.swa_every == 0:
+            if swa_state is None:
+                swa_state = {name: arr.astype(np.float32, copy=True) if np.issubdtype(arr.dtype, np.floating) else arr.copy() for name, arr in current_flat_np.items()}
+                swa_count = 1
+                log(f"swa:start step:{step + 1}")
+            else:
+                for name, arr in current_flat_np.items():
+                    if np.issubdtype(arr.dtype, np.floating):
+                        swa_state[name] += arr.astype(np.float32, copy=False)
+                    else:
+                        swa_state[name] = arr
+                swa_count += 1
 
         step_ms = 1000.0 * (time.perf_counter() - step_t0)
         approx_train_time_ms = train_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1067,34 +1449,56 @@ def main() -> None:
         if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
             stop_after_step = step
 
+    log("ema:applying averaged weights")
+    final_avg_state = {name: arr.copy() for name, arr in ema_state.items()}
+    if args.swa_enabled and swa_state is not None and swa_count > 0:
+        log(f"swa:blending {swa_count} late checkpoints with EMA")
+        for name, arr in final_avg_state.items():
+            if np.issubdtype(arr.dtype, np.floating):
+                final_avg_state[name] = 0.5 * arr + 0.5 * (swa_state[name] / float(swa_count))
+    load_flat_state_np(model, final_avg_state)
+    mx.synchronize()
+
     # ==============================================================================
-    # FINAL SERIALIZATION + QUANTIZED ROUNDTRIP EVAL
+    # FINAL SERIALIZATION + AR-GPTQ ROUNDTRIP EVAL
     # ==============================================================================
-    # We always write a raw artifact and a quantized artifact, then validate the
-    # quantized roundtrip directly by loading the dequantized tensors back into the
-    # model and running one final validation pass.
     out_path = out_dir / f"{args.run_id}_mlx_model.npz"
     flat_state = {k: v for k, v in tree_flatten(model.state)}
     mx.savez(str(out_path), **flat_state)
     log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(flat_state)
+    # EDIT: Build GPTQ calibration statistics from self-generated tokens rather than any dataset split.
+    calib_tokens = generate_autoregressive_calib_tokens(model, args)
+    log(
+        f"gptq:generated_ar_calibration num_seqs:{args.calib_num_seqs} "
+        f"seq_len:{args.train_seq_len} temperature:{args.calib_temperature}"
+    )
+    hessians = collect_hessians_from_tokens(model, calib_tokens)
+    log(f"gptq:collected_hessians tensors:{len(hessians)}")
+
+    quant_obj, quant_stats = quantize_state_dict_int6(flat_state, hessians=hessians, block_size=args.gptq_block_size)
+    quant_obj = selective_prune_quantized_int6(
+        quant_obj,
+        target_total_bytes=int(args.target_mb * 1024 * 1024),
+        code_bytes=len(code.encode("utf-8")),
+    )
     quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
-    quant_blob = zlib.compress(quant_raw, level=9)
+    quant_blob = lzma.compress(quant_raw, preset=9)
     quant_serialized_bytes = len(quant_raw)
-    quant_path = out_dir / f"{args.run_id}_mlx_model.int8.ptz"
+    quant_path = out_dir / f"{args.run_id}_mlx_model.int6.ptz"
     with quant_path.open("wb") as f:
         f.write(quant_blob)
     quant_file_bytes = quant_path.stat().st_size
-    ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+    ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int6_payload_bytes"], 1)
     log(
-        f"serialized_model_int8_zlib:{quant_file_bytes} bytes "
-        f"(payload:{quant_stats['int8_payload_bytes']} raw_pickle:{quant_serialized_bytes} payload_ratio:{ratio:.2f}x)"
+        f"serialized_model_int6_lzma:{quant_file_bytes} bytes "
+        f"(payload:{quant_stats['int6_payload_bytes']} raw_pickle:{quant_serialized_bytes} payload_ratio:{ratio:.2f}x "
+        f"total_with_code:{quant_file_bytes + len(code.encode('utf-8'))})"
     )
 
     with quant_path.open("rb") as f:
         quant_blob_disk = f.read()
-    quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob_disk)))
+    quant_flat = dequantize_state_dict_int6(pickle.loads(lzma.decompress(quant_blob_disk)))
     model.update(tree_unflatten(list(quant_flat.items())))
     q_t0 = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
@@ -1107,8 +1511,8 @@ def main() -> None:
         log_fn=log,
     )
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
-    log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
-    log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log(f"final_int6_lzma_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
+    log(f"final_int6_lzma_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
 
 if __name__ == "__main__":
