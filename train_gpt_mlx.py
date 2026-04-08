@@ -83,6 +83,12 @@ class Hyperparameters:
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    ar_hessian_strength: float = float(os.environ.get("AR_HESSIAN_STRENGTH", 0.0))
+    ar_hessian_base_num_seqs: int = int(os.environ.get("AR_HESSIAN_BASE_NUM_SEQS", 64))
+    ar_hessian_batch_size: int = int(os.environ.get("AR_HESSIAN_BATCH_SIZE", 8))
+    ar_hessian_seq_len: int = int(os.environ.get("AR_HESSIAN_SEQ_LEN", 2048))
+    ar_hessian_temperature: float = float(os.environ.get("AR_HESSIAN_TEMPERATURE", 0.8))
+    ar_hessian_block_size: int = int(os.environ.get("AR_HESSIAN_BLOCK_SIZE", 128))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -110,6 +116,10 @@ class Hyperparameters:
     @property
     def microbatch_tokens(self) -> int:
         return self.train_batch_tokens // self.grad_accum_steps
+
+    @property
+    def ar_hessian_num_seqs(self) -> int:
+        return max(0, int(round(self.ar_hessian_base_num_seqs * max(self.ar_hessian_strength, 0.0))))
 
     def lr_mul(self, step: int, elapsed_ms: float) -> float:
         if self.warmdown_iters <= 0:
@@ -285,7 +295,11 @@ class CastedLinear(nn.Module):
         super().__init__()
         self.weight = nn.Linear(in_dim, out_dim, bias=False).weight.astype(mx.float32)
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, collector: dict[str, list[np.ndarray]] | None = None, name: str | None = None) -> mx.array:
+        if collector is not None and name is not None:
+            collector.setdefault(f"{name}.weight", []).append(
+                np.ascontiguousarray(np.array(x.reshape(-1, x.shape[-1]).astype(mx.float32), dtype=np.float32, copy=False))
+            )
         return x @ self.weight.astype(x.dtype).T
 
 
@@ -327,18 +341,18 @@ class CausalSelfAttention(nn.Module):
         self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
         self.scale = self.head_dim ** -0.5
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, collector: dict[str, list[np.ndarray]] | None = None, prefix: str | None = None) -> mx.array:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = self.c_q(x, collector=collector, name=None if prefix is None else f"{prefix}.c_q").reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = self.c_k(x, collector=collector, name=None if prefix is None else f"{prefix}.c_k").reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = self.c_v(x, collector=collector, name=None if prefix is None else f"{prefix}.c_v").reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
         q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
         k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
         q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
         y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
-        return self.proj(y)
+        return self.proj(y, collector=collector, name=None if prefix is None else f"{prefix}.proj")
 
 
 class MLP(nn.Module):
@@ -349,9 +363,9 @@ class MLP(nn.Module):
         self.fc = CastedLinear(dim, hidden)
         self.proj = CastedLinear(hidden, dim)
 
-    def __call__(self, x: mx.array) -> mx.array:
-        x = nn.relu(self.fc(x))
-        return self.proj(x * x)
+    def __call__(self, x: mx.array, collector: dict[str, list[np.ndarray]] | None = None, prefix: str | None = None) -> mx.array:
+        x = nn.relu(self.fc(x, collector=collector, name=None if prefix is None else f"{prefix}.fc"))
+        return self.proj(x * x, collector=collector, name=None if prefix is None else f"{prefix}.proj")
 
 
 class Block(nn.Module):
@@ -373,12 +387,12 @@ class Block(nn.Module):
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
 
-    def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, x0: mx.array, collector: dict[str, list[np.ndarray]] | None = None, prefix: str | None = None) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        attn_out = self.attn(self.attn_norm(x), collector=collector, prefix=None if prefix is None else f"{prefix}.attn")
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x), collector=collector, prefix=None if prefix is None else f"{prefix}.mlp")
         return x
 
 
@@ -433,6 +447,20 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
+        return self.final_norm(x)
+
+    def forward_with_collector(self, input_ids: mx.array, collector: dict[str, list[np.ndarray]] | None = None) -> mx.array:
+        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        x0 = x
+        skips: list[mx.array] = []
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0, collector=collector, prefix=f"blocks.{i}")
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
+            block_idx = self.num_encoder_layers + i
+            x = self.blocks[block_idx](x, x0, collector=collector, prefix=f"blocks.{block_idx}")
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
@@ -593,7 +621,62 @@ def quantize_float_array(arr: mx.array) -> tuple[np.ndarray, np.ndarray]:
     return np.ascontiguousarray(q), scale
 
 
-def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str, object], dict[str, int]]:
+def gptq_quantize_matrix_int8(weight: np.ndarray, hessian: np.ndarray | None, block_size: int) -> tuple[np.ndarray, np.ndarray]:
+    w = np.ascontiguousarray(weight.astype(np.float32, copy=False))
+    q = np.empty_like(w, dtype=np.int8)
+    scales = np.empty((w.shape[0],), dtype=np.float32)
+    if hessian is None or hessian.shape != (w.shape[1], w.shape[1]):
+        for row_idx in range(w.shape[0]):
+            q[row_idx], scales[row_idx] = quantize_float_array(mx.array(w[row_idx], dtype=mx.float32))
+        return np.ascontiguousarray(q), np.ascontiguousarray(scales.astype(INT8_PER_ROW_SCALE_DTYPE, copy=False))
+
+    h = np.array(hessian, dtype=np.float64, copy=True)
+    if not np.all(np.isfinite(h)):
+        for row_idx in range(w.shape[0]):
+            q[row_idx], scales[row_idx] = quantize_float_array(mx.array(w[row_idx], dtype=mx.float32))
+        return np.ascontiguousarray(q), np.ascontiguousarray(scales.astype(INT8_PER_ROW_SCALE_DTYPE, copy=False))
+    h.flat[:: h.shape[0] + 1] += 1e-4
+    perm = np.argsort(-np.diag(h))
+    inv_perm = np.argsort(perm)
+    h = h[np.ix_(perm, perm)]
+    try:
+        h_inv = np.linalg.inv(h)
+        h_chol = np.linalg.cholesky(h_inv).T
+    except np.linalg.LinAlgError:
+        for row_idx in range(w.shape[0]):
+            q[row_idx], scales[row_idx] = quantize_float_array(mx.array(w[row_idx], dtype=mx.float32))
+        return np.ascontiguousarray(q), np.ascontiguousarray(scales.astype(INT8_PER_ROW_SCALE_DTYPE, copy=False))
+
+    w_perm = w[:, perm]
+    for row_idx in range(w_perm.shape[0]):
+        row = w_perm[row_idx].astype(np.float64, copy=True)
+        q_row = np.empty((w_perm.shape[1],), dtype=np.int8)
+        scale = float(np.maximum(np.quantile(np.abs(row.astype(np.float32, copy=False)), INT8_CLIP_Q) / 127.0, 1.0 / 127.0))
+        scales[row_idx] = scale
+        for block_start in range(0, w_perm.shape[1], block_size):
+            block_end = min(block_start + block_size, w_perm.shape[1])
+            local = row[block_start:block_end].copy()
+            local_chol = h_chol[block_start:block_end, block_start:block_end]
+            local_err = np.zeros((block_end - block_start,), dtype=np.float64)
+            for local_col in range(block_end - block_start):
+                diag = max(float(local_chol[local_col, local_col]), 1e-8)
+                q_val = int(np.clip(np.round(local[local_col] / scale), -127, 127))
+                q_row[block_start + local_col] = np.int8(q_val)
+                err = (local[local_col] - q_val * scale) / diag
+                local_err[local_col] = err
+                if local_col + 1 < local.shape[0]:
+                    local[local_col + 1 :] -= err * local_chol[local_col, local_col + 1 :]
+            if block_end < w_perm.shape[1]:
+                row[block_end:] -= local_err @ h_chol[block_start:block_end, block_end:]
+        q[row_idx] = q_row[inv_perm]
+    return np.ascontiguousarray(q), np.ascontiguousarray(scales.astype(INT8_PER_ROW_SCALE_DTYPE, copy=False))
+
+
+def quantize_state_dict_int8(
+    flat_state: dict[str, mx.array],
+    hessians: dict[str, np.ndarray] | None = None,
+    block_size: int = 128,
+) -> tuple[dict[str, object], dict[str, int]]:
     quantized: dict[str, np.ndarray] = {}
     scales: dict[str, np.ndarray] = {}
     dtypes: dict[str, str] = {}
@@ -623,8 +706,12 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_array(arr)
-        if s.ndim > 0:
+        f32 = _np_float32(arr)
+        if f32.ndim == 2:
+            q, s = gptq_quantize_matrix_int8(f32, None if hessians is None else hessians.get(name), block_size)
+        else:
+            q, s = quantize_float_array(arr)
+        if np.asarray(s).ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
         scales[name] = s
@@ -667,6 +754,44 @@ def dequantize_state_dict_int8(quant_obj: dict[str, object]) -> dict[str, mx.arr
         else:
             out[name] = mx.array(out_arr)
     return out
+
+
+def sample_next_token(logits: np.ndarray, temperature: float, rng: np.random.Generator) -> np.ndarray:
+    if temperature <= 0:
+        return np.argmax(logits, axis=-1).astype(np.int32, copy=False)
+    scaled = logits / temperature
+    scaled = scaled - scaled.max(axis=-1, keepdims=True)
+    probs = np.exp(scaled)
+    probs /= probs.sum(axis=-1, keepdims=True)
+    return np.array([rng.choice(probs.shape[1], p=probs[i]) for i in range(probs.shape[0])], dtype=np.int32)
+
+
+def generate_autoregressive_hessian_tokens(model: GPT, args: Hyperparameters) -> np.ndarray:
+    rng = np.random.default_rng(args.seed)
+    tokens = np.zeros((args.ar_hessian_num_seqs, args.ar_hessian_seq_len), dtype=np.int32)
+    tokens[:, 0] = rng.integers(0, args.vocab_size, size=(args.ar_hessian_num_seqs,), dtype=np.int32)
+    for start in range(0, args.ar_hessian_num_seqs, args.ar_hessian_batch_size):
+        end = min(start + args.ar_hessian_batch_size, args.ar_hessian_num_seqs)
+        batch = tokens[start:end]
+        for pos in range(1, args.ar_hessian_seq_len):
+            hidden = model(mx.array(batch[:, :pos], dtype=mx.int32))
+            logits = np.array((hidden[:, -1, :] @ model.tok_emb.weight.astype(hidden.dtype).T).astype(mx.float32))
+            logits = args.logit_softcap * np.tanh(logits / args.logit_softcap)
+            batch[:, pos] = sample_next_token(logits, args.ar_hessian_temperature, rng)
+        tokens[start:end] = batch
+    return tokens
+
+
+def collect_hessians_from_tokens(model: GPT, token_batches: np.ndarray, batch_size: int) -> dict[str, np.ndarray]:
+    collector: dict[str, list[np.ndarray]] = {}
+    for start in range(0, token_batches.shape[0], batch_size):
+        batch = token_batches[start : start + batch_size]
+        model.forward_with_collector(mx.array(batch, dtype=mx.int32), collector=collector)
+    hessians: dict[str, np.ndarray] = {}
+    for name, chunks in collector.items():
+        x = np.concatenate(chunks, axis=0).astype(np.float64, copy=False)
+        hessians[name] = np.ascontiguousarray(x.T @ x)
+    return hessians
 
 
 def build_sentencepiece_luts(
@@ -1078,7 +1203,19 @@ def main() -> None:
     mx.savez(str(out_path), **flat_state)
     log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(flat_state)
+    hessians: dict[str, np.ndarray] | None = None
+    if args.ar_hessian_num_seqs > 0:
+        log(
+            f"ar_hessian:generating calibration strength:{args.ar_hessian_strength:.2f} "
+            f"num_seqs:{args.ar_hessian_num_seqs} seq_len:{args.ar_hessian_seq_len} "
+            f"temperature:{args.ar_hessian_temperature}"
+        )
+        calib_tokens = generate_autoregressive_hessian_tokens(model, args)
+        log("ar_hessian:collecting X^T X hessians from autoregressive data")
+        hessians = collect_hessians_from_tokens(model, calib_tokens, batch_size=args.ar_hessian_batch_size)
+        log(f"ar_hessian:collected_hessians tensors:{len(hessians)} block_size:{args.ar_hessian_block_size}")
+
+    quant_obj, quant_stats = quantize_state_dict_int8(flat_state, hessians=hessians, block_size=args.ar_hessian_block_size)
     quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
     quant_blob = zlib.compress(quant_raw, level=9)
     quant_serialized_bytes = len(quant_raw)

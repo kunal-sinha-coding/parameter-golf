@@ -1,15 +1,36 @@
 #!/usr/bin/env python3
 """
-- Switches the MLX baseline to the AR-calibrated record-style stack: 11 layers, LeakyReLU(0.5)^2 MLP, partial RoPE, BigramHash, and XSA on all layers by default.
-- Adds autoregressive self-generated calibration data collection so post-training quantization does not read train or validation tokens.
-- Replaces the int8+zlib export path with an int6 + LZMA export path using Hessian-aware GPTQ-style row quantization when calibration Hessians are available.
-- Adds size-targeted selective pruning of low-impact +/-1 quantized values so the compressed artifact can be pushed toward a requested byte budget.
-- Marks all substantive changes with inline `EDIT:` comments so the diff is easy to audit.
+MLX reimplementation of the "AR Self-Gen GPTQ + XSA-all + BigramHash 3072x112"
+parameter-golf solution described in `documentation/autoregressive_hessian.md`.
 
-Repo: https://github.com/kunal-sinha-coding/parameter-golf/blob/main/records/track_10min_16mb/2026-03-25_ValCalib_GPTQ_XSA_BigramHash3072/README.md
+What this script is trying to achieve:
+- Train a compact language model using the same broad architecture ideas as the
+  current documented state of the art for this project.
+- Quantize that model into a very small artifact without reading any training
+  or validation data after training has finished.
+- Do the quantization legally for parameter golf by generating calibration
+  tokens autoregressively from the trained model itself, then building the
+  GPTQ Hessians from those self-generated sequences.
 
-Command:
-BIGRAM_VOCAB_SIZE=3072 BIGRAM_DIM=112 WARMDOWN_ITERS=4000 TARGET_MB=15.9 SEED=314 python3 train_gpt_mlx_ar.py
+What is implemented here:
+- The record-style 11-layer stack with LeakyReLU(0.5)^2 MLPs, partial RoPE,
+  BigramHash, SmearGate, VE, and XSA on all layers by default.
+- Autoregressive self-generation of calibration sequences after training.
+- Full-Hessian GPTQ-style int6 quantization with:
+  - Hessians H = X^T X collected from the generated sequences,
+  - diagonal damping for numerical stability,
+  - column reordering by Hessian importance,
+  - Cholesky-based error compensation,
+  - blockwise error propagation,
+  - and a small clip-range search to find a better per-row scale.
+- LZMA compression plus selective pruning of low-impact +/-1 entries so the
+  final serialized artifact can stay close to a target byte budget.
+
+In parameter-golf terms, the point of this solution is to keep the model small
+enough to fit the artifact cap while recovering some of the quality that would
+normally be lost to aggressive int6 quantization. The autoregressive Hessian is
+the key trick that makes a stronger full-GPTQ quantizer legal in this setting,
+because calibration comes only from the model's own generated tokens.
 """
 from __future__ import annotations
 
@@ -781,8 +802,7 @@ INT6_MAX = 31
 INT6_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT6_KEEP_FLOAT_STORE_DTYPE = np.float16
 INT6_PER_ROW_SCALE_DTYPE = np.float16
-INT6_CLIP_PERCENTILE = 99.99984
-INT6_CLIP_Q = INT6_CLIP_PERCENTILE / 100.0
+INT6_CLIP_PERCENTILES = (0.9990, 0.9995, 0.9999, 0.99999, 1.0)
 
 
 def _np_float32(arr: mx.array) -> np.ndarray:
@@ -798,47 +818,180 @@ def keep_float_array(name: str, arr: mx.array, passthrough_orig_dtypes: dict[str
     return np.ascontiguousarray(np.array(arr, copy=True))
 
 
-def quantize_row_int6(row: np.ndarray) -> tuple[np.ndarray, np.float32]:
-    clip_abs = float(np.quantile(np.abs(row), INT6_CLIP_Q)) if row.size else 0.0
+def quantize_row_int6(row: np.ndarray, percentile: float = 1.0) -> tuple[np.ndarray, np.float32]:
+    # For a plain row-wise fallback quantizer we first choose a clipping range,
+    # convert that range into one symmetric scale, then round into signed int6.
+    # The percentile parameter lets us ignore a tiny number of outliers when
+    # doing the clip search.
+    abs_row = np.abs(row)
+    if row.size == 0:
+        clip_abs = 0.0
+    elif percentile < 1.0:
+        clip_abs = float(np.quantile(abs_row, percentile))
+    else:
+        clip_abs = float(abs_row.max(initial=0.0))
     scale = np.float32(max(clip_abs / INT6_MAX, 1.0 / INT6_MAX))
     q = np.clip(np.round(np.clip(row, -clip_abs, clip_abs) / scale), -INT6_MAX, INT6_MAX).astype(np.int8, copy=False)
     return np.ascontiguousarray(q), scale
 
 
-def gptq_quantize_matrix(weight: np.ndarray, hessian: np.ndarray | None, block_size: int) -> tuple[np.ndarray, np.ndarray]:
-    # EDIT: Apply a compact Full-Hessian GPTQ-style solve row-by-row when calibration Hessians exist.
+def search_rowwise_int6_quantization(weight: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    # The record implementation does a tiny clip search instead of assuming that
+    # "clip at max absolute value" is always best. This helps a lot on small
+    # models where a handful of large outliers can distort an entire row scale.
+    #
+    # We search over a few percentiles, quantize every row with one scale per
+    # row, reconstruct, and keep the variant with the lowest mean squared error.
     w = np.ascontiguousarray(weight.astype(np.float32, copy=False))
-    q = np.empty_like(w, dtype=np.int8)
-    scales = np.empty((w.shape[0],), dtype=np.float32)
-    if hessian is None or hessian.shape[0] != w.shape[1]:
+    best_q: np.ndarray | None = None
+    best_scales: np.ndarray | None = None
+    best_err = float("inf")
+    for percentile in INT6_CLIP_PERCENTILES:
+        q_rows: list[np.ndarray] = []
+        scales = np.empty((w.shape[0],), dtype=np.float16)
         for row_idx in range(w.shape[0]):
-            q[row_idx], scales[row_idx] = quantize_row_int6(w[row_idx])
-        return q, scales
+            q_row, scale = quantize_row_int6(w[row_idx], percentile=percentile)
+            q_rows.append(q_row)
+            scales[row_idx] = scale
+        q = np.ascontiguousarray(np.stack(q_rows, axis=0))
+        recon = q.astype(np.float32) * scales.astype(np.float32)[:, None]
+        mse = float(np.mean(np.square(w - recon), dtype=np.float64))
+        if mse < best_err:
+            best_q = q
+            best_scales = scales.copy()
+            best_err = mse
+    assert best_q is not None and best_scales is not None
+    return best_q, np.ascontiguousarray(best_scales)
+
+
+def gptq_quantize_matrix(weight: np.ndarray, hessian: np.ndarray | None, block_size: int) -> tuple[np.ndarray, np.ndarray]:
+    # EDIT: Apply the record-style Full-Hessian GPTQ solve when calibration Hessians exist.
+    #
+    # The important idea is that quantizing one column changes the "best" value
+    # of later columns. GPTQ models that coupling with the Hessian and pushes the
+    # resulting error forward so later columns can compensate for earlier ones.
+    #
+    # This function follows the documented record solution closely:
+    # 1. collect H = X^T X from calibration activations,
+    # 2. damp the diagonal so H is numerically safe,
+    # 3. reorder columns so the most important columns get quantized first,
+    # 4. use a Cholesky-based inverse factor to scale quantization errors,
+    # 5. quantize in blocks while propagating each local error to the remaining
+    #    unquantized columns,
+    # 6. search a small family of clipping percentiles and keep the lowest-MSE
+    #    reconstruction.
+    w = np.ascontiguousarray(weight.astype(np.float32, copy=False))
+    if hessian is None or hessian.shape != (w.shape[1], w.shape[1]):
+        # No valid Hessian means we cannot do full GPTQ, so we fall back to the
+        # row-wise clip search above.
+        return search_rowwise_int6_quantization(w)
 
     h = np.array(hessian, dtype=np.float64, copy=True)
-    h.flat[:: h.shape[0] + 1] += 1e-4
-    inv = np.linalg.inv(h)
-    for row_idx in range(w.shape[0]):
-        row = w[row_idx].astype(np.float64, copy=True)
-        q_row = np.empty((w.shape[1],), dtype=np.int8)
-        _, scale = quantize_row_int6(row.astype(np.float32, copy=False))
-        scales[row_idx] = scale
-        for block_start in range(0, w.shape[1], block_size):
-            block_end = min(block_start + block_size, w.shape[1])
-            for col in range(block_start, block_end):
-                q_val = np.clip(np.round(row[col] / scale), -INT6_MAX, INT6_MAX)
-                q_row[col] = np.int8(q_val)
-                err = row[col] - float(q_val) * float(scale)
-                row -= err * inv[:, col] / max(inv[col, col], 1e-8)
-        q[row_idx] = q_row
-    return np.ascontiguousarray(q), np.ascontiguousarray(scales.astype(INT6_PER_ROW_SCALE_DTYPE, copy=False))
+    dead = np.diag(h) == 0
+    h[dead, dead] = 1.0
+
+    # Damping stabilizes nearly singular Hessians. The record uses a diagonal
+    # bump proportional to the average diagonal magnitude.
+    damp = 0.01 * float(np.mean(np.diag(h)))
+    h[np.diag_indices_from(h)] += damp
+
+    # Quantize the most "important" columns first. Larger Hessian diagonal
+    # entries indicate that errors on those columns are more expensive.
+    perm = np.argsort(np.diag(h))[::-1]
+    inv_perm = np.argsort(perm)
+    w_perm = np.ascontiguousarray(w[:, perm].copy())
+    w_perm[:, dead[perm]] = 0.0
+    h_perm = np.ascontiguousarray(h[perm][:, perm])
+
+    # GPTQ typically works with a Cholesky factor of the inverse Hessian. We use
+    # the same trick because dividing by the local diagonal of this factor gives
+    # the correct curvature-aware normalization for each column's error term.
+    h_chol = np.linalg.cholesky(h_perm)
+    h_inv = np.linalg.inv(h_chol)
+    h_inv = h_inv.T @ h_inv
+    h_inv_chol = np.linalg.cholesky(h_inv).T
+
+    best_q: np.ndarray | None = None
+    best_scales: np.ndarray | None = None
+    best_err = float("inf")
+
+    for percentile in INT6_CLIP_PERCENTILES:
+        # One scale per output row. We search over a small family of clipping
+        # thresholds and keep whichever reconstructed matrix is best.
+        row_abs = np.abs(w)
+        if percentile < 1.0:
+            row_clip = np.quantile(row_abs, percentile, axis=1)
+        else:
+            row_clip = np.max(row_abs, axis=1)
+        scales = np.maximum(row_clip / INT6_MAX, 1.0 / INT6_MAX).astype(np.float16, copy=False)
+        scales_f32 = scales.astype(np.float32)
+
+        q_perm = np.zeros_like(w_perm, dtype=np.int8)
+        w_work = w_perm.astype(np.float64, copy=True)
+
+        # Process the reordered columns in blocks so local compensation uses a
+        # small dense working set, but errors still flow into future blocks.
+        for block_start in range(0, w_perm.shape[1], block_size):
+            block_end = min(block_start + block_size, w_perm.shape[1])
+            block_count = block_end - block_start
+            w_block = w_work[:, block_start:block_end].copy()
+            q_block = np.zeros((w_perm.shape[0], block_count), dtype=np.int8)
+            err_block = np.zeros((w_perm.shape[0], block_count), dtype=np.float64)
+            h_block = h_inv_chol[block_start:block_end, block_start:block_end]
+
+            for local_col in range(block_count):
+                # Quantize the current column using the row scale, then turn the
+                # residual into a curvature-normalized error that later columns
+                # will absorb.
+                w_col = w_block[:, local_col]
+                denom = max(float(h_block[local_col, local_col]), 1e-8)
+                q_col = np.clip(np.round(w_col / scales_f32), -INT6_MAX, INT6_MAX).astype(np.int8, copy=False)
+                q_block[:, local_col] = q_col
+                err = (w_col - q_col.astype(np.float64) * scales_f32.astype(np.float64)) / denom
+                w_block[:, local_col:] -= err[:, None] * h_block[local_col, local_col:][None, :]
+                err_block[:, local_col] = err
+
+            q_perm[:, block_start:block_end] = q_block
+            if block_end < w_perm.shape[1]:
+                w_work[:, block_end:] -= err_block @ h_inv_chol[block_start:block_end, block_end:]
+
+        # Evaluate in the permuted space because that is where the GPTQ solve ran.
+        recon_perm = q_perm.astype(np.float32) * scales_f32[:, None]
+        mse = float(np.mean(np.square(w_perm - recon_perm), dtype=np.float64))
+        if mse < best_err:
+            best_q = q_perm[:, inv_perm].copy()
+            best_scales = scales.copy()
+            best_err = mse
+
+    assert best_q is not None and best_scales is not None
+    return np.ascontiguousarray(best_q), np.ascontiguousarray(best_scales.astype(INT6_PER_ROW_SCALE_DTYPE, copy=False))
 
 
 def quantize_vector_int6(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    clip_abs = float(np.quantile(np.abs(arr).reshape(-1), INT6_CLIP_Q)) if arr.size else 0.0
-    scale = np.array(clip_abs / INT6_MAX if clip_abs > 0.0 else 1.0, dtype=np.float32)
-    q = np.clip(np.round(np.clip(arr, -clip_abs, clip_abs) / scale), -INT6_MAX, INT6_MAX).astype(np.int8, copy=False)
-    return np.ascontiguousarray(q), scale
+    # 1D tensors do not get the full matrix GPTQ treatment, but we still reuse
+    # the same tiny clip search so vectors are not forced to quantize around a
+    # single possibly-bad outlier.
+    best_q: np.ndarray | None = None
+    best_scale: np.ndarray | None = None
+    best_err = float("inf")
+    abs_arr = np.abs(arr).reshape(-1)
+    for percentile in INT6_CLIP_PERCENTILES:
+        if arr.size == 0:
+            clip_abs = 0.0
+        elif percentile < 1.0:
+            clip_abs = float(np.quantile(abs_arr, percentile))
+        else:
+            clip_abs = float(abs_arr.max(initial=0.0))
+        scale = np.array(clip_abs / INT6_MAX if clip_abs > 0.0 else 1.0, dtype=np.float32)
+        q = np.clip(np.round(np.clip(arr, -clip_abs, clip_abs) / scale), -INT6_MAX, INT6_MAX).astype(np.int8, copy=False)
+        recon = q.astype(np.float32) * float(scale)
+        mse = float(np.mean(np.square(arr.astype(np.float32) - recon), dtype=np.float64))
+        if mse < best_err:
+            best_q = np.ascontiguousarray(q)
+            best_scale = scale.copy()
+            best_err = mse
+    assert best_q is not None and best_scale is not None
+    return best_q, best_scale
 
 
 def quantize_state_dict_int6(
@@ -983,14 +1136,26 @@ def generate_autoregressive_calib_tokens(model: GPT, args: Hyperparameters) -> n
 
 
 def collect_hessians_from_tokens(model: GPT, token_batches: np.ndarray) -> dict[str, np.ndarray]:
-    # EDIT: Replay AR-generated sequences through an instrumented forward pass and accumulate X^T X per linear layer.
+    # EDIT: Replay AR-generated sequences through an instrumented forward pass and
+    # accumulate H = X^T X for every quantized linear layer.
+    #
+    # We intentionally do this as a streaming accumulation instead of storing one
+    # giant activation matrix per layer. That keeps the logic easy to follow
+    # while avoiding a large temporary memory spike when calibration sequences
+    # are long.
     collector: dict[str, list[np.ndarray]] = {}
     for batch in token_batches:
         model.forward_with_collector(mx.array(batch[None, :], dtype=mx.int32), collector=collector)
     hessians: dict[str, np.ndarray] = {}
     for name, chunks in collector.items():
-        x = np.concatenate(chunks, axis=0).astype(np.float64, copy=False)
-        hessians[name] = np.ascontiguousarray((x.T @ x) / max(x.shape[0], 1))
+        feature_dim = chunks[0].shape[1]
+        h = np.zeros((feature_dim, feature_dim), dtype=np.float64)
+        token_count = 0
+        for chunk in chunks:
+            x = chunk.astype(np.float64, copy=False)
+            h += x.T @ x
+            token_count += x.shape[0]
+        hessians[name] = np.ascontiguousarray(h / max(token_count, 1))
     return hessians
 
 
@@ -1167,22 +1332,30 @@ def clip_grad_tree(grads_tree: dict, max_norm: float) -> dict:
     return tree_unflatten([(k, g * scale) for k, g in flat.items()])
 
 
-def snapshot_flat_state_np(model: nn.Module) -> dict[str, np.ndarray]:
+def snapshot_flat_state_np(model: nn.Module) -> dict[str, np.ndarray | int | float | bool]:
     flat = dict(tree_flatten(model.state))
-    snap: dict[str, np.ndarray] = {}
+    snap: dict[str, np.ndarray | int | float | bool] = {}
     for name, arr in flat.items():
-        if mx.issubdtype(arr.dtype, mx.floating):
+        if not hasattr(arr, "dtype"):
+            snap[name] = arr
+        elif mx.issubdtype(arr.dtype, mx.floating):
             snap[name] = np.array(arr.astype(mx.float32), copy=True)
         else:
             snap[name] = np.array(arr, copy=True)
     return snap
 
 
-def load_flat_state_np(model: nn.Module, flat_np: dict[str, np.ndarray]) -> None:
+def load_flat_state_np(
+    model: nn.Module, flat_np: dict[str, np.ndarray | int | float | bool]
+) -> None:
     current = dict(tree_flatten(model.state))
     restored = []
     for name, arr in current.items():
-        restored.append((name, mx.array(flat_np[name], dtype=arr.dtype)))
+        value = flat_np[name]
+        if not hasattr(arr, "dtype"):
+            restored.append((name, value))
+        else:
+            restored.append((name, mx.array(value, dtype=arr.dtype)))
     model.update(tree_unflatten(restored))
 
 
@@ -1419,19 +1592,26 @@ def main() -> None:
         mx.synchronize()
         current_flat_np = snapshot_flat_state_np(model)
         for name, arr in current_flat_np.items():
-            if np.issubdtype(arr.dtype, np.floating):
+            if hasattr(arr, "dtype") and np.issubdtype(arr.dtype, np.floating):
                 ema_state[name] *= args.ema_decay
                 ema_state[name] += arr * (1.0 - args.ema_decay)
             else:
                 ema_state[name] = arr
         if args.swa_enabled and lr_mul < args.swa_start_lr_frac and (step + 1) % args.swa_every == 0:
             if swa_state is None:
-                swa_state = {name: arr.astype(np.float32, copy=True) if np.issubdtype(arr.dtype, np.floating) else arr.copy() for name, arr in current_flat_np.items()}
+                swa_state = {
+                    name: (
+                        arr.astype(np.float32, copy=True)
+                        if hasattr(arr, "dtype") and np.issubdtype(arr.dtype, np.floating)
+                        else arr.copy() if hasattr(arr, "copy") else arr
+                    )
+                    for name, arr in current_flat_np.items()
+                }
                 swa_count = 1
                 log(f"swa:start step:{step + 1}")
             else:
                 for name, arr in current_flat_np.items():
-                    if np.issubdtype(arr.dtype, np.floating):
+                    if hasattr(arr, "dtype") and np.issubdtype(arr.dtype, np.floating):
                         swa_state[name] += arr.astype(np.float32, copy=False)
                     else:
                         swa_state[name] = arr
@@ -1450,11 +1630,13 @@ def main() -> None:
             stop_after_step = step
 
     log("ema:applying averaged weights")
-    final_avg_state = {name: arr.copy() for name, arr in ema_state.items()}
+    final_avg_state = {
+        name: arr.copy() if hasattr(arr, "copy") else arr for name, arr in ema_state.items()
+    }
     if args.swa_enabled and swa_state is not None and swa_count > 0:
         log(f"swa:blending {swa_count} late checkpoints with EMA")
         for name, arr in final_avg_state.items():
-            if np.issubdtype(arr.dtype, np.floating):
+            if hasattr(arr, "dtype") and np.issubdtype(arr.dtype, np.floating):
                 final_avg_state[name] = 0.5 * arr + 0.5 * (swa_state[name] / float(swa_count))
     load_flat_state_np(model, final_avg_state)
     mx.synchronize()
